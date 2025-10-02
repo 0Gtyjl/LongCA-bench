@@ -13,6 +13,7 @@ from magi_attention.common.enum import AttnMaskType
 from magi_attention.common.range import AttnRange
 from magi_attention.common.ranges import AttnRanges
 
+
 @dataclass
 class MaskFactors:
     cu_seqlens: list[int] | None = None
@@ -391,7 +392,7 @@ class MaskGenerator:
         q_ranges, k_ranges, attn_mask_type = infer_attn_mask_from_sliding_window(
             q_range=AttnRange(start=0, end=total_seqlen),
             k_range=AttnRange(start=0, end=total_seqlen),
-            window_size=window_size,
+            window_size=window_size,  # type: ignore
         )
 
         attn_type_map = [
@@ -405,7 +406,7 @@ class MaskGenerator:
         ]
 
         return (
-            q_ranges.to_naive_ranges(),
+            q_ranges.to_naive_ranges(),  # type: ignore
             k_ranges.to_naive_ranges(),
             attn_type_map,
             mask_factors,
@@ -472,8 +473,8 @@ class MaskGenerator:
             for mask_type in sw_attn_mask_type
         ]
 
-        q_ranges.extend(sw_q_ranges.to_naive_ranges())
-        k_ranges.extend(sw_k_ranges.to_naive_ranges())
+        q_ranges.extend(sw_q_ranges.to_naive_ranges())  # type: ignore
+        k_ranges.extend(sw_k_ranges.to_naive_ranges())  # type: ignore
         is_causal_mapping.extend(sw_attn_type_map)
 
         mask_factors = MaskFactors(window_size=window_size_single)

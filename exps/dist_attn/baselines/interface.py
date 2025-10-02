@@ -7,6 +7,7 @@ import torch
 from magi_attention.common import AttnRanges
 from magi_attention.common.enum import AttnMaskType
 
+
 class AttnBackend(Enum):
     TE = ("te",)
     FA3 = "fa3"

@@ -25,7 +25,9 @@ def nvml_context():
     yield
     py3nvml.nvmlShutdown()
 
+
 # import paddle
+
 
 class MemRecorder:
     def __init__(self, mode="allocated", device_idx=0) -> None:
@@ -336,7 +338,7 @@ class Mark(object):
             },
         )
         COLOR_PALETTE = sns.color_palette("viridis", n_colors=len(bench.line_names))
-        
+
         # my_color = [
         #     "b6b3d6",
         #     "cfcce3",
@@ -347,7 +349,7 @@ class Mark(object):
         #     "f1837a",
         #     "e9687a",
         # ]
-        
+
         # my_color = [
         #     "f7a6a7",
         #     "eec78a",
@@ -358,10 +360,10 @@ class Mark(object):
         #     "9ec4ee",
         #     "c7c6eb"
         # ]
-        
+
         # COLOR_PALETTE = [
         #     tuple(min(int(num[i:i+2], 16)/255 * 0.8, 1.0) for i in (0,2,4))
-        #     for num in my_color 
+        #     for num in my_color
         # ]
 
         if not bench.plot_name:
