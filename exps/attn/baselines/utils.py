@@ -1,6 +1,9 @@
+import os
 import random
-from functools import partial
+from functools import partial, lru_cache
 from itertools import accumulate, pairwise
+from typing import List, Tuple
+import numpy as np
 
 try:
     import paddle
@@ -1037,3 +1040,319 @@ def generate_flashmask_indices(
         is_causal = False
 
     return attn_mask_startend_row_indices, is_causal
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+
+# availability check
+def block_sparse_available(
+    attn_impl: str, num_q_heads: int, num_kv_heads: int, block_size: int, wd: str
+) -> bool:
+    """
+    Check availability of different block sparse attention implementations.
+    """
+    if attn_impl == "vsa" or attn_impl == "vsa_triton":
+        # currently vsa only supports block size == 64
+        return num_q_heads == num_kv_heads and block_size == 64
+
+    if attn_impl == "flashinfer":
+        # flashinfer doesn't support backward
+        return wd == "fwd"
+
+    if attn_impl == "ffa" or attn_impl == "flex":
+        return True
+
+    return True
+
+
+def var_block_sparse_available(attn_impl: str, wd: str) -> bool:
+    if attn_impl == "flashinfer":
+        # flashinfer doesn't support variable block size
+        return wd == "fwd"
+    return True
+
+
+# ================ Utils for VSA ================
+def get_vsa_mask_from_block_sparse_score(
+    scores: torch.Tensor,
+    k: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Converts a block-wise attention score into a block-sparse index format
+    that is compatible with FastVideo VSA (Video Sparse Attention).
+
+    Args:
+        scores (torch.Tensor): The attention scores of shape [b, h, num_q_blocks, num_kv_blocks].
+        k (int): The number of key-value blocks each query block attends to.
+
+    Returns:
+        q2k_block_sparse_index: [bs, hq, num_q_blocks, k]
+            Contains the indices of kv blocks that each q block attends to.
+        q2k_block_sparse_num: [bs, hq, num_q_blocks]
+            Contains the number of kv blocks that each q block attends to (all equal to k).
+        k2q_block_sparse_index: [bs, hk, num_kv_blocks, num_q_blocks]
+            Contains the indices of q blocks that attend to each kv block.
+        k2q_block_sparse_num: [bs, hk, num_kv_blocks]
+            Contains the number of q blocks that attend to each kv block.
+    """
+
+    device = scores.device
+    # Ensure mask has batch dimension
+    if scores.dim() == 3:  # Assuming [h, num_q_blocks, num_kv_blocks]
+        scores = scores.unsqueeze(0)  # Add batch_size 1
+
+    bs, h, num_q_blocks, num_kv_blocks = scores.shape
+    # Ensure k is not larger than num_kv_blocks
+    k = min(k, num_kv_blocks)
+
+    # Get top-k indices for each q block
+    _, q2k_block_sparse_index = torch.topk(scores, k, dim=-1)
+    q2k_block_sparse_index = q2k_block_sparse_index.to(torch.int32)
+
+    # sort q2k_block_sparse_index
+    q2k_block_sparse_index, _ = torch.sort(q2k_block_sparse_index, dim=-1)
+
+    # All q blocks attend to exactly k kv blocks
+    q2k_block_sparse_num = torch.full(
+        (bs, h, num_q_blocks), k, dtype=torch.int32, device=device
+    )
+
+    # Fill in the mask based on the indices
+    for b in range(bs):
+        for head in range(h):
+            for q_idx in range(num_q_blocks):
+                kv_indices = q2k_block_sparse_index[b, head, q_idx]
+
+    # Create the reverse mapping (k2q)
+    # First, initialize lists to collect q indices for each kv block
+    k2q_indices_list: List[List[List[int]]] = [
+        [[] for _ in range(num_kv_blocks)] for _ in range(bs * h)
+    ]
+
+    # Populate the lists based on q2k mapping
+    for b in range(bs):
+        for head in range(h):
+            flat_idx = b * h + head
+            for q_idx in range(num_q_blocks):
+                kv_indices = q2k_block_sparse_index[b, head, q_idx].tolist()
+                for kv_idx in kv_indices:
+                    k2q_indices_list[flat_idx][kv_idx].append(q_idx)
+
+    # Find the maximum number of q blocks that attend to any kv block
+    max_q_per_kv = 0
+    for flat_idx in range(bs * h):
+        for kv_idx in range(num_kv_blocks):
+            max_q_per_kv = max(max_q_per_kv, len(k2q_indices_list[flat_idx][kv_idx]))
+
+    # Create tensors for k2q mapping
+    k2q_block_sparse_index = torch.full(
+        (bs, h, num_kv_blocks, max_q_per_kv), -1, dtype=torch.int32, device=device
+    )
+    k2q_block_sparse_num = torch.zeros(
+        (bs, h, num_kv_blocks), dtype=torch.int32, device=device
+    )
+
+    # Fill the tensors
+    for b in range(bs):
+        for head in range(h):
+            flat_idx = b * h + head
+            for kv_idx in range(num_kv_blocks):
+                q_indices = k2q_indices_list[flat_idx][kv_idx]
+                num_q = len(q_indices)
+                k2q_block_sparse_num[b, head, kv_idx] = num_q
+                if num_q > 0:
+                    k2q_block_sparse_index[b, head, kv_idx, :num_q] = torch.tensor(
+                        q_indices, dtype=torch.int32, device=device
+                    )
+
+    return (
+        q2k_block_sparse_index,
+        q2k_block_sparse_num,
+        k2q_block_sparse_index,
+        k2q_block_sparse_num,
+    )
+
+
+# ================ Utils for flashinfer ================
+def get_flashinfer_uniform_block_index(
+    num_q_blocks: int,
+    num_kv_blocks: int,
+    seq_len_q: int,
+    seq_len_k: int,
+    num_kv_heads: int,
+):
+    # synthesize uniform block sizes
+    block_row_sz = torch.ones(num_q_blocks, dtype=torch.int32) * (
+        seq_len_q // num_q_blocks
+    )
+    block_row_sz[-1] = seq_len_q - (seq_len_q // num_q_blocks) * (num_q_blocks - 1)
+    block_row_sz = block_row_sz.unsqueeze(0).repeat(num_kv_heads, 1)
+
+    block_col_sz = torch.ones(num_kv_blocks, dtype=torch.int32) * (
+        seq_len_k // num_kv_blocks
+    )
+    block_col_sz[-1] = seq_len_k - (seq_len_k // num_kv_blocks) * (num_kv_blocks - 1)
+    block_col_sz = block_col_sz.unsqueeze(0).repeat(num_kv_heads, 1)
+
+    return block_row_sz, block_col_sz
+
+
+# ================ Utils for flexattn ================
+@lru_cache
+def create_block_mask_cached(score_mod, B, H, M, N, device="cuda"):
+    block_mask = create_block_mask(score_mod, B, H, M, N, device=device)
+    return block_mask
+
+
+def flex_mask_mod(
+    b_idx: torch.IntTensor,
+    h_idx: torch.IntTensor,
+    q_idx: torch.IntTensor,
+    k_idx: torch.IntTensor,
+    q_block_idx: torch.IntTensor,
+    k_block_idx: torch.IntTensor,
+    block_mask: torch.BoolTensor,
+) -> torch.BoolTensor:
+    """
+    Block sparse mask for FlexAttention.
+    Get each query/key token's block id, and return the corresponding mask value.
+
+    q_block_idx: [num_heads, seq_len_q]
+    k_block_idx: [num_heads, seq_len_k]
+    block_mask: [num_heads, num_q_blocks, num_kv_blocks]
+    """
+    q_block_id = q_block_idx[h_idx, q_idx]
+    k_block_id = k_block_idx[h_idx, k_idx]
+    return block_mask[h_idx, q_block_id, k_block_id]
+
+
+def get_var_block_idx(
+    block_mask: torch.Tensor,
+    seq_len_q: int,
+    seq_len_k: int,
+    block_row_sz: torch.Tensor,
+    block_col_sz: torch.Tensor,
+    bsz: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Helper function to get block indices for variable blocks.
+    """
+    bsz, num_heads, num_q_blocks, num_kv_blocks = block_mask.shape
+    device = block_mask.device
+
+    # Create a column of zeros for concatenation
+    zeros_col_shape = (num_heads, 1)
+    zeros = torch.zeros(zeros_col_shape, dtype=block_row_sz.dtype, device=device)
+
+    # Calculate row (query) offsets
+    row_cumsum = torch.cumsum(block_row_sz, dim=1)
+    row_offsets = torch.cat([zeros, row_cumsum], dim=1)
+
+    # Calculate column (key/value) offsets
+    col_cumsum = torch.cumsum(block_col_sz, dim=1)
+    col_offsets = torch.cat([zeros, col_cumsum], dim=1)
+
+    row_offsets_list = row_offsets.tolist()
+    col_offsets_list = col_offsets.tolist()
+
+    q_block_idx = torch.zeros((num_heads, seq_len_q), dtype=torch.int32, device=device)
+    k_block_idx = torch.zeros((num_heads, seq_len_k), dtype=torch.int32, device=device)
+
+    for head_idx in range(num_heads):
+        for q_block in range(num_q_blocks):
+            q_start = row_offsets_list[head_idx][q_block]
+            q_end = row_offsets_list[head_idx][q_block + 1]
+            q_block_idx[head_idx, q_start:q_end] = q_block
+
+        for k_block in range(num_kv_blocks):
+            k_start = col_offsets_list[head_idx][k_block]
+            k_end = col_offsets_list[head_idx][k_block + 1]
+            k_block_idx[head_idx, k_start:k_end] = k_block
+
+    return q_block_idx, k_block_idx
+
+
+def get_uniform_block_idx(
+    block_mask: torch.Tensor,
+    seq_len_q: int,
+    seq_len_k: int,
+    bsz: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Helper function to get block indices for uniform blocks.
+    """
+    bsz, num_heads, num_q_blocks, num_kv_blocks = block_mask.shape
+    device = block_mask.device
+
+    assert seq_len_q % num_q_blocks == 0, "seq_len_q must be divisible by num_q_blocks"
+    assert (
+        seq_len_k % num_kv_blocks == 0
+    ), "seq_len_k must be divisible by num_kv_blocks"
+
+    q_block_size = seq_len_q // num_q_blocks
+    k_block_size = seq_len_k // num_kv_blocks
+
+    q_block_idx = torch.arange(0, seq_len_q, device=device) // q_block_size
+    k_block_idx = torch.arange(0, seq_len_k, device=device) // k_block_size
+    q_block_idx = q_block_idx.unsqueeze(0).repeat(num_heads, 1).to(torch.int32)
+    k_block_idx = k_block_idx.unsqueeze(0).repeat(num_heads, 1).to(torch.int32)
+
+    return q_block_idx, k_block_idx
+
+
+def get_flex_mask_from_block_mask(
+    block_mask: torch.Tensor,
+    seq_len_q: int,
+    seq_len_k: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    block_row_sz: torch.Tensor = None,
+    block_col_sz: torch.Tensor = None,
+    bsz: int = 1,
+):
+    bsz, num_heads, num_q_blocks, num_kv_blocks = block_mask.shape
+    assert num_heads == num_q_heads, "Block mask must be query-specific"
+    device = block_mask.device
+
+    if block_row_sz is None and block_col_sz is None:
+        mode = "uniform"
+    else:
+        mode = "variable"
+
+    if mode == "variable":
+        block_col_sz = block_col_sz.repeat_interleave(
+            num_q_heads // num_kv_heads, dim=0
+        )
+        q_block_idx, k_block_idx = get_var_block_idx(
+            block_mask=block_mask,
+            seq_len_q=seq_len_q,
+            seq_len_k=seq_len_k,
+            block_row_sz=block_row_sz,
+            block_col_sz=block_col_sz,
+            bsz=bsz,
+        )
+    elif mode == "uniform":
+        q_block_idx, k_block_idx = get_uniform_block_idx(
+            block_mask=block_mask, seq_len_q=seq_len_q, seq_len_k=seq_len_k, bsz=bsz
+        )
+    # TODO: assume batch size is 1 for now
+    block_mask = block_mask.squeeze(0)
+
+    mask_mod = partial(
+        flex_mask_mod,
+        q_block_idx=q_block_idx,
+        k_block_idx=k_block_idx,
+        block_mask=block_mask,
+    )
+
+    flex_mask = create_block_mask_cached(
+        mask_mod, bsz, num_heads, seq_len_q, seq_len_k, device=device
+    )
+
+    return flex_mask
